@@ -1,0 +1,11 @@
+[package]
+name = "sqtop"
+version = "0.1.0"
+edition = "2021"
+description = "Read-only Slurm schedule explorer over SSH"
+license = "MIT"
+readme = "README.md"
+keywords = ["slurm", "hpc", "tui", "ssh", "scheduling"]
+categories = ["command-line-utilities", "visualization"]
+
+[dependencies]
