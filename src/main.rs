@@ -1,8 +1,25 @@
 mod cli;
+mod model;
+mod remote;
 
+use anyhow::Result;
 use clap::Parser;
 
-fn main() {
+#[tokio::main]
+async fn main() -> Result<()> {
     let args = cli::Args::parse();
-    println!("Host: {}", args.host);
+    let snapshot = remote::collect(&args.host).await?;
+    println!(
+        "{} | {} nodes | {} jobs",
+        snapshot.collected,
+        snapshot.nodes.len(),
+        snapshot.jobs.len()
+    );
+    for job in snapshot.jobs {
+        println!(
+            "{} | {} | {} | {} | {} nodes | {}",
+            job.id, job.user, job.partition, job.state, job.nodes, job.name
+        );
+    }
+    Ok(())
 }
