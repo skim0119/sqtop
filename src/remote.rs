@@ -17,7 +17,7 @@ pub struct Connection {
 }
 
 impl Connection {
-    pub async fn connect(host: &str) -> Result<Self> {
+    pub async fn connect(host: &str) -> Result<(Self, u64)> {
         let session = match existing_session(host).await? {
             Some(session) => session,
             None => new_session(host).await?,
@@ -26,8 +26,9 @@ impl Connection {
             session: Arc::new(session),
             viewer: String::new(),
         };
+        let mut received = 0;
         let output = connection
-            .run("printf '%s\\n' \"${USER:-$(id -un)}\"")
+            .run("printf '%s\\n' \"${USER:-$(id -un)}\"", &mut received)
             .await?;
         let viewer = String::from_utf8(output.stdout).context("remote account is not UTF-8")?;
         let viewer = viewer.trim();
@@ -35,10 +36,10 @@ impl Connection {
             bail!("invalid remote account name");
         }
         connection.viewer = viewer.to_owned();
-        Ok(connection)
+        Ok((connection, received))
     }
 
-    async fn run(&self, script: &str) -> Result<std::process::Output> {
+    async fn run(&self, script: &str, received: &mut u64) -> Result<std::process::Output> {
         let output = tokio::time::timeout(
             Duration::from_secs(20),
             self.session.raw_command(script).output(),
@@ -46,6 +47,8 @@ impl Connection {
         .await
         .context("SSH command timed out")?
         .context("running remote command")?;
+        // Count completed output even when the command exits with an error.
+        *received += (output.stdout.len() + output.stderr.len()) as u64;
         if !output.status.success() {
             bail!(
                 "SSH/Slurm command failed: {}",
@@ -55,13 +58,13 @@ impl Connection {
         Ok(output)
     }
 
-    pub async fn collect(&self, include_cpu: bool) -> Result<Snapshot> {
+    pub async fn collect(&self, include_cpu: bool, received: &mut u64) -> Result<Snapshot> {
         let remote_command = if include_cpu {
             format!("{REMOTE_COMMAND} && printf '\\n__SQTOP_CPU__\\n' && sinfo -N -h -o '%N|%C|%O'")
         } else {
             REMOTE_COMMAND.to_owned()
         };
-        let output = self.run(&remote_command).await?;
+        let output = self.run(&remote_command, received).await?;
         let text = String::from_utf8(output.stdout).context("Slurm output is not UTF-8")?;
         let (jobs, cpu) = if include_cpu {
             let (jobs, cpu) = text
@@ -150,7 +153,6 @@ fn decode(text: &str) -> Result<Snapshot> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[tokio::test]
     #[ignore = "requires SQTOP_TEST_SSH_HOST with an existing authenticated SSH master"]
     async fn reuses_master_without_closing_it() {

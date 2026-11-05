@@ -28,12 +28,14 @@ const REFRESH_SECONDS: u64 = 300;
 async fn main() -> Result<()> {
     let args = cli::Args::parse();
     // Authenticate before raw mode so SSH can use the terminal for login prompts.
-    let connection = remote::Connection::connect(&args.host).await?;
+    let (connection, received) = remote::Connection::connect(&args.host).await?;
     // Separate channels carry network results and CPU-bound projection results.
     let (tx, mut rx) = mpsc::channel(1);
     let (estimate_tx, mut estimate_rx) = mpsc::unbounded_channel();
     let mut generation = 0_u64;
     let mut app = ui::App::new(args.host);
+    app.traffic.requests = 1; // Remote account lookup.
+    app.traffic.received = received;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     // Raw mode delivers individual key presses; the alternate screen preserves shell contents.
     enable_raw_mode()?;
@@ -49,17 +51,21 @@ async fn main() -> Result<()> {
             // Keep at most one SSH collection in flight, including manual refreshes.
             if Instant::now() >= next_refresh && !app.loading {
                 app.loading = true;
+                app.traffic.requests += 1;
                 let tx = tx.clone();
                 let connection = connection.clone();
                 let include_cpu = app.tab == 1; // Only the Jobs view needs sinfo node loads.
                 tokio::spawn(async move {
-                    let _ = tx.send(connection.collect(include_cpu).await).await;
+                    let mut received = 0;
+                    let result = connection.collect(include_cpu, &mut received).await;
+                    let _ = tx.send((result, received)).await;
                 });
                 next_refresh = Instant::now() + Duration::from_secs(REFRESH_SECONDS);
             }
             // Never wait on a worker here; drawing and keyboard handling must keep running.
-            if let Ok(result) = rx.try_recv() {
+            if let Ok((result, received)) = rx.try_recv() {
                 app.loading = false;
+                app.traffic.received += received;
                 match result {
                     Ok(snapshot) => {
                         app.set_snapshot(snapshot);

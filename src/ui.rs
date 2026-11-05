@@ -11,7 +11,39 @@ use ratatui::{
     Frame,
 };
 
+#[derive(Debug)]
+pub struct Traffic {
+    pub requests: u64,
+    pub received: u64,
+    started: std::time::Instant,
+}
+
+impl Default for Traffic {
+    fn default() -> Self {
+        Self {
+            requests: 0,
+            received: 0,
+            started: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Traffic {
+    pub fn summary(&self, refresh_seconds: u64) -> String {
+        let bytes = self.received;
+        let rate = bytes as f64 / self.started.elapsed().as_secs_f64().max(1.0);
+        format!(
+            "SSH: {} req | RX {:.1} KiB | avg {:.0} B/s | poll {}s",
+            self.requests,
+            bytes as f64 / 1024.0,
+            rate,
+            refresh_seconds,
+        )
+    }
+}
+
 pub struct App {
+    pub traffic: Traffic,
     pub snapshot: Option<Snapshot>,
     pub error: Option<String>,
     pub loading: bool,
@@ -30,6 +62,7 @@ pub struct App {
 impl App {
     pub fn new(host: String) -> Self {
         Self {
+            traffic: Traffic::default(),
             snapshot: None,
             error: None,
             loading: false,
@@ -598,7 +631,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     frame.render_widget(
         Paragraph::new(vec![
             Line::from(header),
-            Line::from(format!("poll {}s", crate::REFRESH_SECONDS)).right_aligned(),
+            Line::from(app.traffic.summary(crate::REFRESH_SECONDS)).right_aligned(),
         ]),
         areas[0],
     );
@@ -816,6 +849,43 @@ mod tests {
         assert!(screen.contains("Unable to load Slurm data: squeue failed"));
         assert!(screen.contains("Press r to retry or q to quit."));
         assert!(!screen.contains("Connecting to Slurm"));
+    }
+
+    #[test]
+    fn traffic_summary_uses_owned_totals() {
+        let traffic = Traffic {
+            requests: 3,
+            received: 2048,
+            started: std::time::Instant::now() - std::time::Duration::from_secs(2),
+        };
+        let summary = traffic.summary(300);
+        assert!(summary.contains("SSH: 3 req | RX 2.0 KiB"));
+        assert!(summary.contains("poll 300s"));
+        assert!(!summary.contains("NaN"));
+    }
+
+    #[test]
+    fn traffic_indicator_is_visible_before_data_arrives() {
+        for width in [60, 80, 120] {
+            let mut app = App::new(String::new());
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            let row: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .chunks(width as usize)
+                .nth(1)
+                .unwrap()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(
+                row.contains("SSH: 0 req | RX 0.0 KiB | avg 0 B/s | poll 300s"),
+                "{row}"
+            );
+            assert!(row.ends_with("poll 300s"));
+        }
     }
 
     #[test]
