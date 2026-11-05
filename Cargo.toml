@@ -9,3 +9,4 @@ keywords = ["slurm", "hpc", "tui", "ssh", "scheduling"]
 categories = ["command-line-utilities", "visualization"]
 
 [dependencies]
+clap = { version = "4", features = ["derive"] }

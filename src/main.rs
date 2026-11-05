@@ -1,3 +1,8 @@
+mod cli;
+
+use clap::Parser;
+
 fn main() {
-    println!("sqtop {}", env!("CARGO_PKG_VERSION"));
+    let args = cli::Args::parse();
+    println!("Host: {}", args.host);
 }
