@@ -1,6 +1,6 @@
 mod cli;
-mod model;
 mod remote;
+mod slurm_parser;
 
 use anyhow::Result;
 use clap::Parser;
@@ -8,7 +8,9 @@ use clap::Parser;
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = cli::Args::parse();
-    let snapshot = remote::collect(&args.host).await?;
+    let connection = remote::Connection::connect(&args.host).await?;
+    let snapshot = connection.collect().await?;
+    println!("Account: {}", snapshot.viewer);
     println!(
         "{} | {} nodes | {} jobs",
         snapshot.collected,

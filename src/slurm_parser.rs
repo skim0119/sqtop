@@ -31,6 +31,7 @@ pub struct Snapshot {
     pub nodes: Vec<Node>,
     pub jobs: Vec<Job>,
     pub collected: DateTime<Local>,
+    pub viewer: String,
 }
 
 fn value<'a>(line: &'a str, key: &str) -> &'a str {
@@ -94,6 +95,7 @@ pub fn parse(nodes: &str, jobs: &str) -> Result<Snapshot> {
         nodes: parsed_nodes,
         jobs: parsed_jobs,
         collected: Local::now(),
+        viewer: String::new(),
     })
 }
 
