@@ -1,4 +1,6 @@
 mod cli;
+#[allow(dead_code)]
+mod projection;
 mod remote;
 mod slurm_parser;
 
