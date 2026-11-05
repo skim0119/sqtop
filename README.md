@@ -22,7 +22,13 @@ q: Quit
 
 ## Install
 
-With a Rust toolchain installed, run from the source directory:
+With Homebrew:
+
+```sh
+brew install skim0119/tap/sqtop
+```
+
+Or build from source with a Rust toolchain:
 
 ```sh
 cargo install --locked --path .
@@ -37,7 +43,7 @@ sqtop user@host
 sqtop --help
 ```
 
-The host can be an SSH alias or `user@host`. This increment validates and prints the destination; remote collection comes next.
+Pass an SSH alias or `user@host` to open the dashboard.
 
 Use the same SSH alias or `user@host` you would pass to `ssh`. sqtop uses your OpenSSH configuration and authentication. No sqtop configuration file is needed.
 
