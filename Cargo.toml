@@ -9,4 +9,7 @@ keywords = ["slurm", "hpc", "tui", "ssh", "scheduling"]
 categories = ["command-line-utilities", "visualization"]
 
 [dependencies]
+anyhow = "1"
+chrono = "0.4"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "time"] }
 clap = { version = "4", features = ["derive"] }

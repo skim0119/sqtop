@@ -6,6 +6,8 @@ I'm building sqtop to maintain my sanity while waiting for Slurm. I'd like to st
 
 Refreshing the queue hasn't made it move faster so far. I have tried.
 
+![sqtop schedule view showing running jobs, Slurm scheduled jobs, proxy projections, and your schedule](assets/page1_v0.png)
+
 ## Install
 
 With a Rust toolchain installed, run from the source directory:
