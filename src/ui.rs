@@ -243,6 +243,13 @@ fn plot(projection: &Projection, height: usize, width: usize) -> Vec<Line<'stati
         Color::Rgb(150, 85, 190),
         Color::Rgb(190, 150, 245),
     ];
+    const OWN: [Color; 5] = [
+        Color::Rgb(120, 245, 140),
+        Color::Rgb(255, 220, 100),
+        Color::Rgb(110, 230, 255),
+        Color::Rgb(255, 165, 100),
+        Color::Rgb(245, 150, 220),
+    ];
     let mut lines = Vec::new();
     let columns = chart_columns(projection, width);
     let height = height.max(1);
@@ -296,17 +303,44 @@ fn plot(projection: &Projection, height: usize, width: usize) -> Vec<Line<'stati
                     col.own_simulated,
                 ),
             ];
-            if own_ranges.iter().any(|&(start, count)| {
-                if count == 0 || start >= projection.nodes {
-                    return false;
-                }
-                let end = start.saturating_add(count).min(projection.nodes);
-                let midpoint = u64::from(start) + u64::from(end) - 1;
-                midpoint * height as u64 / (2 * u64::from(projection.nodes)) == row as u64
-            }) {
-                cell = ('◆', Color::LightGreen);
+            let own_marker = own_ranges
+                .iter()
+                .enumerate()
+                .find_map(|(source, &(start, count))| {
+                    if count == 0 || start >= projection.nodes {
+                        return None;
+                    }
+                    let end = start.saturating_add(count).min(projection.nodes);
+                    let (bands, offset) = if source == 0 {
+                        (&projection.running_bands, 0)
+                    } else {
+                        (
+                            &projection.pending_bands,
+                            col.unavailable
+                                .saturating_add(col.own_running)
+                                .saturating_add(col.running),
+                        )
+                    };
+                    let marker = |start: u32, end: u32| {
+                        let midpoint = u64::from(start) + u64::from(end) - 1;
+                        midpoint * height as u64 / (2 * u64::from(projection.nodes)) == row as u64
+                    };
+                    // Keep small jobs visible individually rather than marking their combined range.
+                    if let Some(bands) = bands.get(*source_index) {
+                        bands.iter().find_map(|band| {
+                            let left = band.start.saturating_add(offset).max(start);
+                            let right = band.end.saturating_add(offset).min(end);
+                            (left < right && marker(left, right))
+                                .then_some(OWN[usize::from(band.color)])
+                        })
+                    } else {
+                        marker(start, end).then_some(Color::LightGreen)
+                    }
+                });
+            if let Some(color) = own_marker {
+                cell = ('◆', color);
             }
-            if !matches!(cell.0, ' ' | '×' | '◆') {
+            if own_marker.is_none() && !matches!(cell.0, ' ' | '×') {
                 let running_size = col
                     .unavailable
                     .saturating_add(col.own_running)
@@ -328,7 +362,11 @@ fn plot(projection: &Projection, height: usize, width: usize) -> Vec<Line<'stati
                         .get(bands.partition_point(|band| band.end <= position))
                         .filter(|band| band.start <= position)
                 }) {
-                    cell.1 = colors[usize::from(band.color)];
+                    cell.1 = if cell.0 == '◆' {
+                        OWN[usize::from(band.color)]
+                    } else {
+                        colors[usize::from(band.color)]
+                    };
                 }
             }
             spans.push(Span::styled(
@@ -776,7 +814,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             Style::default().fg(Color::Rgb(244, 93, 93)),
         ),
         Span::raw("  "),
-        Span::styled("▒ proxy", Style::default().fg(Color::Rgb(192, 120, 235))),
+        Span::styled(
+            "▒ proxy schedule",
+            Style::default().fg(Color::Rgb(192, 120, 235)),
+        ),
         Span::raw("  "),
         Span::raw("colors=jobs  "),
         Span::styled("◆ yours", Style::default().fg(Color::LightGreen)),
@@ -1085,6 +1126,35 @@ mod tests {
     }
 
     #[test]
+    fn separate_small_proxy_jobs_each_get_a_marker() {
+        let now = chrono::Local::now();
+        let nodes = (1..=100)
+            .map(|i| format!("NodeName=n{i} CPUAlloc=0 State=IDLE Partitions=p\n"))
+            .collect::<String>();
+        let mut snapshot = crate::slurm_parser::parse(
+            &nodes,
+            "1|me|p|PENDING|1|N/A|N/A|(null)|1:00:00|one|Resources\n2|me|p|PENDING|20|N/A|N/A|(null)|1:00:00|two|Resources\n",
+        ).unwrap();
+        snapshot.viewer = "me".into();
+        let projection = Projection::build(&snapshot, "p", 48 * 3600, now);
+        assert_eq!(projection.placements.len(), 2);
+        let lines = plot(&projection, 10, TIME_BUCKETS);
+        // The one-node job needs its own fallback; the larger job samples row 1.
+        assert_eq!(lines[9].spans[1].content, "◆");
+        assert_eq!(lines[8].spans[1].content, "◆");
+        assert_ne!(lines[9].spans[1].style.fg, lines[8].spans[1].style.fg);
+        assert_eq!(lines[9].spans[1].style.fg, lines[9].spans[2].style.fg);
+        assert_eq!(lines[8].spans[1].style.fg, lines[8].spans[2].style.fg);
+        assert_eq!(
+            lines[..10]
+                .iter()
+                .filter(|line| line.spans[1].content == "◆")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
     fn small_proxy_job_remains_visible_in_a_compressed_timeline() {
         let mut columns = vec![Column::default(); TIME_BUCKETS];
         columns[1] = Column {
@@ -1300,6 +1370,7 @@ mod tests {
         assert!(graph_rows >= 5, "chart needs enough vertical resolution");
         assert!(screen.contains("42  running"));
         assert!(screen.contains("Your schedule"));
+        assert!(screen.contains("▒ proxy schedule"));
         assert!(!screen.contains("Fast starts"));
         assert!(screen.contains("Running + scheduled + proxy"));
         assert!(screen.contains("Partition: p"));
