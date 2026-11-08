@@ -503,19 +503,174 @@ fn cpu_measurement(node: Option<&crate::slurm_parser::CpuNode>, bar_width: usize
         return format!("{:>6} {:>4}  unavailable", "N/A", node.total);
     };
     let ratio = load / f64::from(node.total);
-    let filled = (ratio * bar_width as f64)
-        .round()
-        .clamp(0.0, bar_width as f64) as usize;
-    let bar = if bar_width > 0 {
-        format!(
-            " [{}{}]",
-            "#".repeat(filled),
-            "-".repeat(bar_width - filled)
-        )
-    } else {
-        String::new()
-    };
+    let bar = usage_bar(ratio, bar_width);
     format!("{load:>6.2} {:>4}{bar} {:>6.1}%", node.total, ratio * 100.0)
+}
+
+fn usage_bar(ratio: f64, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let filled = (ratio * width as f64).round().clamp(0.0, width as f64) as usize;
+    format!(" [{}{}]", "#".repeat(filled), "-".repeat(width - filled))
+}
+
+fn usage_line(label: String, ratio: Option<f64>, width: usize, color: Color) -> Line<'static> {
+    let bar_width = width.saturating_sub(label.chars().count() + 3).min(20);
+    let mut spans = vec![Span::styled(label, Style::default().fg(color))];
+    if let Some(ratio) = ratio
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .filter(|_| bar_width > 0)
+    {
+        let filled = (ratio * bar_width as f64)
+            .round()
+            .clamp(0.0, bar_width as f64) as usize;
+        spans.extend([
+            Span::styled(" [", Style::default().fg(color)),
+            Span::styled(
+                "#".repeat(filled),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "-".repeat(bar_width - filled),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled("]", Style::default().fg(color)),
+        ]);
+    }
+    Line::from(spans)
+}
+
+fn resource_rows(node: &crate::slurm_parser::Node, width: usize) -> Vec<Line<'static>> {
+    let cpu = node
+        .cpus
+        .map(|total| format!("{}/{total}", node.allocated))
+        .unwrap_or_else(|| "N/A".into());
+    let mut lines = vec![metric_line(format!("  Allocated CPU {cpu}"), Color::Gray)];
+    for gpu in &node.gpus {
+        let (model, total, used) = (&gpu.model, gpu.total, gpu.allocated);
+        let label = if model.is_empty() { "GPU" } else { model };
+        let used = used
+            .map(|count| count.to_string())
+            .unwrap_or_else(|| "?".into());
+        lines.push(metric_line(
+            format!("  Allocated GPU {label} {used}/{total}"),
+            Color::Gray,
+        ));
+    }
+    if node.gpus.is_empty() {
+        lines.push(metric_line("  Allocated GPU N/A".into(), WARNING_COLOR));
+    }
+    if let Some(usage) = &node.usage {
+        if let Some((total, available)) = usage.ram {
+            lines.push(usage_line(
+                format!(
+                    "  RAM used {:.1}/{:.1} GiB",
+                    (total - available) as f64 / 1048576.0,
+                    total as f64 / 1048576.0
+                ),
+                (total > 0).then(|| (total - available) as f64 / total as f64),
+                width,
+                RAM_COLOR,
+            ));
+        } else {
+            lines.push(metric_line("  RAM usage unavailable".into(), WARNING_COLOR));
+        }
+        for gpu in &usage.gpus {
+            let utilization = gpu
+                .utilization
+                .map(|value| format!("{value:.0}%"))
+                .unwrap_or_else(|| "N/A".into());
+            let memory = |value: Option<u64>| {
+                value
+                    .map(|v| format!("{:.1}", v as f64 / 1024.0))
+                    .unwrap_or_else(|| "?".into())
+            };
+            lines.push(usage_line(
+                format!("  GPU {} {} busy {utilization}", gpu.index, gpu.name),
+                gpu.utilization.map(|v| v / 100.0),
+                width,
+                if gpu.utilization.is_some() {
+                    GPU_COLOR
+                } else {
+                    WARNING_COLOR
+                },
+            ));
+            let ratio = gpu
+                .used_mib
+                .zip(gpu.total_mib)
+                .filter(|(_, total)| *total > 0)
+                .map(|(used, total)| used as f64 / total as f64);
+            lines.push(usage_line(
+                format!(
+                    "  VRAM used {}/{} GiB",
+                    memory(gpu.used_mib),
+                    memory(gpu.total_mib)
+                ),
+                ratio,
+                width,
+                if ratio.is_some() {
+                    VRAM_COLOR
+                } else {
+                    WARNING_COLOR
+                },
+            ));
+        }
+        if let Some(error) = &node.probe_error {
+            lines.push(metric_line(
+                format!("  Partial usage ({error})"),
+                WARNING_COLOR,
+            ));
+        }
+        if usage.gpus.is_empty() && !node.gpus.is_empty() {
+            lines.push(metric_line("  GPU usage unavailable".into(), WARNING_COLOR));
+        }
+    } else if node.probe_requested {
+        lines.push(metric_line(
+            format!(
+                "  Usage unavailable ({})",
+                node.probe_error
+                    .as_deref()
+                    .unwrap_or("node probe failed/timed out")
+            ),
+            WARNING_COLOR,
+        ));
+    }
+    let mut packed: Vec<Line<'static>> = Vec::new();
+    for mut line in lines {
+        if let Some(last) = packed
+            .last_mut()
+            .filter(|last| last.width() + 3 + line.width() <= width)
+        {
+            last.spans
+                .push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
+            if let Some(first) = line.spans.first_mut() {
+                first.content = first.content.trim_start().to_owned().into();
+            }
+            last.spans.extend(line.spans);
+        } else {
+            packed.push(line);
+        }
+    }
+    packed
+}
+
+#[cfg(test)]
+fn resource_lines(node: &crate::slurm_parser::Node, width: usize) -> Vec<String> {
+    resource_rows(node, width)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect()
+}
+
+const CPU_COLOR: Color = Color::Rgb(137, 220, 235);
+const RAM_COLOR: Color = Color::Rgb(137, 180, 250);
+const GPU_COLOR: Color = Color::Rgb(166, 227, 161);
+const VRAM_COLOR: Color = Color::Rgb(203, 166, 247);
+const WARNING_COLOR: Color = Color::Rgb(249, 226, 175);
+
+fn metric_line(text: String, color: Color) -> Line<'static> {
+    Line::styled(text, Style::default().fg(color))
 }
 
 fn draw_job_monitor(
@@ -530,7 +685,7 @@ fn draw_job_monitor(
         .filter(|job| matches!(job.state.as_str(), "RUNNING" | "COMPLETING"))
         .collect();
     let pending: Vec<_> = jobs.iter().filter(|job| job.state == "PENDING").collect();
-    let block = panel(" Running · node load · ↑/↓ ");
+    let block = panel(" Running · node load / allocation · ↑/↓ ");
     let inner = block.inner(panels[0]);
     let mut running_lines = Vec::new();
     if running.is_empty() {
@@ -538,7 +693,10 @@ fn draw_job_monitor(
     } else if let Some(cpu) = &snapshot.cpu {
         let nodes: std::collections::HashMap<_, _> =
             cpu.iter().map(|node| (node.name.as_str(), node)).collect();
-        running_lines.push(Line::from("Node-wide; includes other users"));
+        running_lines.push(Line::styled(
+            "Node-wide; includes other users",
+            Style::default().fg(Color::Gray),
+        ));
         let mut unique_hosts = std::collections::HashSet::new();
         for job in &running {
             if let Some(hosts) = crate::slurm_parser::hosts(&job.node_list) {
@@ -562,18 +720,27 @@ fn draw_job_monitor(
                 format!("Job {}: {}", job.id, job.name),
                 Style::default().fg(Color::Cyan),
             )));
-            running_lines.push(Line::from("NODE         LOAD CPUS  LOAD / CPUS"));
+            running_lines.push(Line::styled(
+                "NODE         LOAD CPUS  LOAD / CPUS",
+                Style::default().fg(CPU_COLOR),
+            ));
             if let Some(hosts) = crate::slurm_parser::hosts(&job.node_list) {
                 let mut hosts: Vec<_> = hosts.into_iter().collect();
                 hosts.sort();
                 for host in hosts {
                     let measurement = cpu_measurement(nodes.get(host.as_str()).copied(), bar_width);
+                    let resources = snapshot.nodes.iter().find(|node| node.name == host);
                     // Long hostnames get their own line so their full identity remains visible.
                     if host.chars().count() > 10 {
                         running_lines.push(Line::from(host));
-                        running_lines.push(Line::from(format!("           {measurement}")));
+                        running_lines
+                            .push(metric_line(format!("           {measurement}"), CPU_COLOR));
                     } else {
-                        running_lines.push(Line::from(format!("{host:<10} {measurement}")));
+                        running_lines
+                            .push(metric_line(format!("{host:<10} {measurement}"), CPU_COLOR));
+                    }
+                    if let Some(node) = resources {
+                        running_lines.extend(resource_rows(node, usize::from(inner.width)));
                     }
                 }
             } else {
@@ -781,7 +948,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         app.running_scroll = running_offset;
         app.own_scroll = pending_offset;
         frame.render_widget(
-            Paragraph::new("sinfo: OS load is node-wide, not job CPU usage"),
+            Paragraph::new("Node-wide: load ≠ CPU busy; allocations ≠ measured RAM/GPU usage"),
             legend_area,
         );
         frame.render_widget(
@@ -837,6 +1004,124 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 mod tests {
     use super::*;
     use ratatui::{backend::TestBackend, Terminal};
+
+    #[test]
+    fn metric_styles_do_not_depend_on_label_text() {
+        let label = "RAM [device] busy N/A";
+        let line = usage_line(label.into(), Some(0.5), 80, GPU_COLOR);
+        assert_eq!(line.spans[0].content, label);
+        assert_eq!(line.spans[0].style.fg, Some(GPU_COLOR));
+        assert!(line
+            .spans
+            .iter()
+            .any(|span| span.style.fg == Some(Color::DarkGray)));
+        assert!(line.to_string().starts_with(label));
+    }
+
+    #[test]
+    fn usage_bars_scale_and_fit_available_width() {
+        assert_eq!(usage_bar(0.0, 4), " [----]");
+        assert_eq!(usage_bar(0.5, 4), " [##--]");
+        assert_eq!(usage_bar(1.5, 4), " [####]");
+        assert_eq!(
+            usage_line("RAM".into(), None, 40, RAM_COLOR).to_string(),
+            "RAM"
+        );
+        assert_eq!(
+            usage_line("RAM".into(), Some(0.5), 10, RAM_COLOR).to_string(),
+            "RAM [##--]"
+        );
+        assert_eq!(
+            usage_line("RAM".into(), Some(0.5), 3, RAM_COLOR).to_string(),
+            "RAM"
+        );
+    }
+
+    #[test]
+    fn measured_usage_display_and_probe_failure() {
+        let mut snapshot =
+            crate::slurm_parser::parse("NodeName=n1 CPUAlloc=1 State=ALLOCATED Partitions=p", "")
+                .unwrap();
+        snapshot.nodes[0].probe_requested = true;
+        assert!(resource_lines(&snapshot.nodes[0], 160)
+            .join(" ")
+            .contains("node probe failed/timed out"));
+        crate::slurm_parser::apply_usage(
+            &mut snapshot,
+            "n1|RAM|8388608|2097152\nn1|GPU|0, NVIDIA GH200, 93, 20480, 98304",
+        );
+        for width in [40, 160] {
+            let lines = resource_lines(&snapshot.nodes[0], width);
+            let text = lines.join(" ");
+            assert!(text.contains("RAM used 6.0/8.0 GiB"));
+            assert!(text.contains("GPU 0 NVIDIA GH200 busy 93%"));
+            assert!(text.contains("VRAM used 20.0/96.0 GiB"));
+            assert!(!text.contains("probe failed"));
+        }
+    }
+
+    #[test]
+    fn vista_display_omits_ram_allocation_and_free() {
+        let snapshot = crate::slurm_parser::parse("NodeName=n1 Arch=aarch64 CPUAlloc=72 ActiveFeatures=arm,gh Gres=(null) RealMemory=1 AllocMem=0 FreeMem=135552 State=ALLOCATED Partitions=gh", "").unwrap();
+        let lines = resource_lines(&snapshot.nodes[0], 160).join("\n");
+        assert!(!lines.contains("RAM free"));
+        assert!(!lines.contains("Allocated RAM"));
+        assert!(lines.contains("Allocated GPU N/A"));
+        assert!(!lines.contains("0.0/0.0"));
+    }
+
+    #[test]
+    fn wide_rows_pack_resources() {
+        let snapshot = crate::slurm_parser::parse(
+            "NodeName=n1 CPUAlloc=2 CPUTot=8 RealMemory=32768 State=MIXED Partitions=p",
+            "",
+        )
+        .unwrap();
+        let mut node = snapshot.nodes[0].clone();
+        node.gpus = vec![crate::slurm_parser::GpuAllocation {
+            model: "h100".into(),
+            total: 4,
+            allocated: Some(2),
+        }];
+        let narrow = resource_lines(&node, 40);
+        let wide = resource_lines(&node, 160);
+        assert_eq!(wide.len(), 1);
+        assert!(wide[0].contains("CPU 2/8 · Allocated GPU h100 2/4"));
+        assert!(narrow.len() > wide.len());
+        assert!(narrow.iter().all(|line| line.chars().count() <= 40));
+    }
+
+    #[test]
+    fn resource_display_shows_reservations_at_narrow_and_wide_sizes() {
+        let mut snapshot = crate::slurm_parser::parse(
+            "NodeName=n1 CPUTot=64 CPUAlloc=32 RealMemory=524288 AllocMem=131072 CfgTRES=gres/gpu=4,gres/gpu:h100=4 AllocTRES=gres/gpu=2 State=MIXED Partitions=p",
+            "42|me|p|RUNNING|1|N/A|N/A|n1|1:00:00|train|n1",
+        ).unwrap();
+        snapshot.viewer = "me".into();
+        snapshot.cpu = Some(crate::slurm_parser::parse_cpu("n1|32/32/0/64|12.4").unwrap());
+        let mut app = App::new(String::new());
+        app.set_snapshot(snapshot);
+        app.key(KeyCode::Char('2'));
+        for width in [60, 100, 160] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 40)).unwrap();
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let rows: Vec<String> = buffer
+                .content()
+                .chunks(width as usize)
+                .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+                .collect();
+            assert!(
+                rows.iter().any(|row| row.contains("Allocated CPU 32/64")),
+                "{rows:#?}"
+            );
+            assert!(
+                rows.iter()
+                    .any(|row| row.contains("Allocated GPU h100 2/4")),
+                "{rows:#?}"
+            );
+        }
+    }
 
     #[test]
     fn instructions_follow_panels_at_all_terminal_sizes() {

@@ -51,21 +51,24 @@ async fn main() -> Result<()> {
             // Keep at most one SSH collection in flight, including manual refreshes.
             if Instant::now() >= next_refresh && !app.loading {
                 app.loading = true;
-                app.traffic.requests += 1;
                 let tx = tx.clone();
                 let connection = connection.clone();
                 let include_cpu = app.tab == 1; // Only the Jobs view needs sinfo node loads.
                 tokio::spawn(async move {
                     let mut received = 0;
-                    let result = connection.collect(include_cpu, &mut received).await;
-                    let _ = tx.send((result, received)).await;
+                    let mut requests = 0;
+                    let result = connection
+                        .collect(include_cpu, &mut received, &mut requests)
+                        .await;
+                    let _ = tx.send((result, received, requests)).await;
                 });
                 next_refresh = Instant::now() + Duration::from_secs(REFRESH_SECONDS);
             }
             // Never wait on a worker here; drawing and keyboard handling must keep running.
-            if let Ok((result, received)) = rx.try_recv() {
+            if let Ok((result, received, requests)) = rx.try_recv() {
                 app.loading = false;
                 app.traffic.received += received;
+                app.traffic.requests += requests;
                 match result {
                     Ok(snapshot) => {
                         app.set_snapshot(snapshot);

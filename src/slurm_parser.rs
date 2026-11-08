@@ -3,7 +3,35 @@ use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Utc};
 use std::collections::HashSet;
 
 #[derive(Clone, Debug)]
+pub struct NodeUsage {
+    pub ram: Option<(u64, u64)>, // Total and available KiB, including reclaimable cache.
+    pub gpus: Vec<GpuUsage>,
+}
+
+#[derive(Clone, Debug)]
+pub struct GpuUsage {
+    pub index: u32,
+    pub name: String,
+    pub utilization: Option<f64>,
+    pub used_mib: Option<u64>,
+    pub total_mib: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GpuAllocation {
+    pub model: String,
+    pub total: u32,
+    pub allocated: Option<u32>,
+}
+
+#[derive(Clone, Debug)]
 pub struct Node {
+    pub name: String,
+    pub probe_requested: bool,
+    pub probe_error: Option<String>,
+    pub usage: Option<NodeUsage>,
+    pub cpus: Option<u32>,
+    pub gpus: Vec<GpuAllocation>,
     pub partitions: Vec<String>,
     pub state: String,
     pub allocated: u32,
@@ -53,6 +81,171 @@ fn number(value: &str) -> u32 {
     value.parse().unwrap_or(0)
 }
 
+// Prefer typed TRES entries; the untyped total describes the same devices.
+fn gpu_counts(text: &str, prefix: &str) -> Vec<(String, u32)> {
+    text.split(',')
+        .filter_map(|entry| {
+            let (kind, count) = entry.split_once('=')?;
+            let model = kind.strip_prefix(prefix)?;
+            if !model.is_empty() && !model.starts_with(':') {
+                return None;
+            }
+            Some((
+                model.trim_start_matches(':').to_owned(),
+                count.parse().ok()?,
+            ))
+        })
+        .collect()
+}
+
+fn gres_counts(text: &str) -> Vec<(String, u32)> {
+    // Index/socket annotations can contain commas; remove them before splitting.
+    let mut depth = 0;
+    let plain: String = text
+        .chars()
+        .filter(|ch| match ch {
+            '(' => {
+                depth += 1;
+                false
+            }
+            ')' => {
+                depth -= 1;
+                false
+            }
+            _ => depth == 0,
+        })
+        .collect();
+    plain
+        .split(',')
+        .filter_map(|entry| {
+            let entry = entry.strip_prefix("gpu:")?;
+            let (model, count) = entry.rsplit_once(':').unwrap_or(("", entry));
+            Some((model.to_owned(), count.parse().ok()?))
+        })
+        .collect()
+}
+
+fn node_gpus(line: &str) -> Vec<GpuAllocation> {
+    let mut configured = gpu_counts(value(line, "CfgTRES"), "gres/gpu");
+    if configured.is_empty() {
+        configured = gres_counts(value(line, "Gres"));
+    }
+    if configured.iter().any(|(model, _)| !model.is_empty()) {
+        configured.retain(|(model, _)| !model.is_empty());
+    }
+    let allocated_text = value(line, "AllocTRES");
+    let allocated = gpu_counts(allocated_text, "gres/gpu");
+    let fallback = gres_counts(value(line, "GresUsed"));
+    let single = configured.len() == 1;
+    configured
+        .into_iter()
+        .map(|(model, total)| {
+            let used = allocated
+                .iter()
+                .find(|(kind, _)| kind == &model)
+                .or_else(|| {
+                    if single {
+                        allocated.iter().find(|(kind, _)| kind.is_empty())
+                    } else {
+                        None
+                    }
+                })
+                .map(|(_, count)| *count)
+                .or_else(|| {
+                    fallback
+                        .iter()
+                        .find(|(kind, _)| kind == &model)
+                        .or_else(|| {
+                            if single {
+                                fallback.iter().find(|(kind, _)| kind.is_empty())
+                            } else {
+                                None
+                            }
+                        })
+                        .map(|(_, count)| *count)
+                })
+                .or_else(|| {
+                    if !allocated_text.is_empty()
+                        && allocated_text != "(null)"
+                        && allocated.is_empty()
+                    {
+                        Some(0)
+                    } else {
+                        None
+                    }
+                });
+            GpuAllocation {
+                model,
+                total,
+                allocated: used,
+            }
+        })
+        .collect()
+}
+
+pub fn apply_usage(snapshot: &mut Snapshot, text: &str) {
+    for line in text.lines() {
+        let fields: Vec<_> = line.splitn(3, '|').collect();
+        if fields.len() != 3 {
+            continue;
+        }
+        let Some(node) = snapshot
+            .nodes
+            .iter_mut()
+            .find(|node| node.name == fields[0] && node.probe_requested)
+        else {
+            continue;
+        };
+        match fields[1] {
+            "ERROR" => node.probe_error = Some(fields[2].chars().take(160).collect()),
+            "RAM" => {
+                let Some((total, available)) = fields[2].split_once('|') else {
+                    continue;
+                };
+                if let (Ok(total), Ok(available)) = (total.parse::<u64>(), available.parse::<u64>())
+                {
+                    if total > 0 && available <= total {
+                        node.usage
+                            .get_or_insert_with(|| NodeUsage {
+                                ram: None,
+                                gpus: Vec::new(),
+                            })
+                            .ram = Some((total, available));
+                    }
+                }
+            }
+            "GPU" => {
+                let values: Vec<_> = fields[2].split(',').map(str::trim).collect();
+                if values.len() != 5 {
+                    continue;
+                }
+                let Ok(index) = values[0].parse::<u32>() else {
+                    continue;
+                };
+                let utilization = values[2]
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|v| v.is_finite() && *v >= 0.0 && *v <= 100.0);
+                let gpu = GpuUsage {
+                    index,
+                    name: values[1].into(),
+                    utilization,
+                    used_mib: values[3].parse().ok(),
+                    total_mib: values[4].parse().ok(),
+                };
+                node.usage
+                    .get_or_insert_with(|| NodeUsage {
+                        ram: None,
+                        gpus: Vec::new(),
+                    })
+                    .gpus
+                    .push(gpu);
+            }
+            _ => {}
+        }
+    }
+}
+
 fn timestamp(value: &str) -> Option<DateTime<Local>> {
     NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S")
         .ok()
@@ -68,6 +261,15 @@ pub fn parse(nodes: &str, jobs: &str) -> Result<Snapshot> {
             bail!("unexpected scontrol node output: {line}");
         }
         parsed_nodes.push(Node {
+            name: name.into(),
+            probe_requested: false,
+            probe_error: None,
+            usage: None,
+            cpus: value(line, "CPUEfctv")
+                .parse()
+                .ok()
+                .or_else(|| value(line, "CPUTot").parse().ok()),
+            gpus: node_gpus(line),
             partitions: value(line, "Partitions")
                 .split(',')
                 .map(str::to_owned)
@@ -242,6 +444,151 @@ pub(crate) fn hosts(list: &str) -> Option<HashSet<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn node_probe_errors_are_preserved() {
+        let mut snapshot =
+            parse("NodeName=n1 CPUAlloc=1 State=ALLOCATED Partitions=p", "").unwrap();
+        snapshot.nodes[0].probe_requested = true;
+        apply_usage(&mut snapshot, "n1|ERROR|SSH host key verification failed");
+        assert_eq!(
+            snapshot.nodes[0].probe_error.as_deref(),
+            Some("SSH host key verification failed")
+        );
+        assert!(snapshot.nodes[0].usage.is_none());
+        apply_usage(
+            &mut snapshot,
+            "n1|RAM|8388608|2097152\nn1|ERROR|node probe timed out",
+        );
+        assert_eq!(
+            snapshot.nodes[0].usage.as_ref().unwrap().ram,
+            Some((8388608, 2097152))
+        );
+        assert_eq!(
+            snapshot.nodes[0].probe_error.as_deref(),
+            Some("node probe timed out")
+        );
+    }
+
+    #[test]
+    fn parses_partial_node_telemetry_without_inventing_values() {
+        let mut snapshot =
+            parse("NodeName=n1 CPUAlloc=1 State=ALLOCATED Partitions=p", "").unwrap();
+        snapshot.nodes[0].probe_requested = true;
+        apply_usage(&mut snapshot, "n1|RAM|223080768|169829376\nn1|GPU|0, NVIDIA GH200 120GB, 93, 20456, 97871\nn1|GPU|1, other, N/A, N/A, 1024\nn2|RAM|100|10\nn1|RAM|10|20\nbanner");
+        let usage = snapshot.nodes[0].usage.as_ref().unwrap();
+        assert_eq!(usage.ram, Some((223080768, 169829376)));
+        assert_eq!(usage.gpus[0].index, 0);
+        assert_eq!(usage.gpus[1].index, 1);
+        assert_eq!(usage.gpus[0].utilization, Some(93.0));
+        assert_eq!(usage.gpus[0].used_mib, Some(20456));
+        assert_eq!(usage.gpus[1].utilization, None);
+        assert_eq!(usage.gpus[1].used_mib, None);
+    }
+
+    #[test]
+    fn missing_gpu_fields_remain_unknown() {
+        assert!(node_gpus(
+            "Arch=aarch64 ActiveFeatures=arm,gh RealMemory=1 Gres=(null) State=ALLOCATED"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn gpu_allocation_falls_back_to_gres_used_without_overriding_tres() {
+        assert_eq!(
+            node_gpus("Gres=gpu:h100:4(S:0-1) GresUsed=gpu:h100:2(IDX:0,2)"),
+            vec![GpuAllocation {
+                model: "h100".into(),
+                total: 4,
+                allocated: Some(2)
+            }]
+        );
+        assert_eq!(
+            node_gpus("Gres=gpu:a100:4,gpu:h100:2 GresUsed=gpu:a100:1(IDX:0),gpu:h100:0(IDX:N/A)"),
+            vec![
+                GpuAllocation {
+                    model: "a100".into(),
+                    total: 4,
+                    allocated: Some(1)
+                },
+                GpuAllocation {
+                    model: "h100".into(),
+                    total: 2,
+                    allocated: Some(0)
+                }
+            ]
+        );
+        assert_eq!(
+            node_gpus("Gres=gpu:4 GresUsed=gpu:2(IDX:0,1)"),
+            vec![GpuAllocation {
+                model: "".into(),
+                total: 4,
+                allocated: Some(2)
+            }]
+        );
+        assert_eq!(
+            node_gpus(
+                "CfgTRES=gres/gpu:h100=4 AllocTRES=gres/gpu:h100=1 GresUsed=gpu:h100:2(IDX:0,1)"
+            ),
+            vec![GpuAllocation {
+                model: "h100".into(),
+                total: 4,
+                allocated: Some(1)
+            }]
+        );
+    }
+
+    #[test]
+    fn node_resources_preserve_unknowns_and_normalize_gpu_rollups() {
+        let snapshot = parse("NodeName=n1 CPUAlloc=8 CPUTot=64 CPUEfctv=60 RealMemory=524288 AllocMem=131072 CfgTRES=cpu=64,gres/gpu=4,gres/gpu:h100=4 AllocTRES=cpu=8,gres/gpu=2 State=MIXED Partitions=p", "").unwrap();
+        let node = &snapshot.nodes[0];
+        assert_eq!(node.cpus, Some(60));
+        assert_eq!(
+            node.gpus,
+            vec![GpuAllocation {
+                model: "h100".into(),
+                total: 4,
+                allocated: Some(2)
+            }]
+        );
+        let unknown = parse(
+            "NodeName=n2 CPUAlloc=0 State=IDLE Partitions=p Gres=gpu:a100:4(S:0-1)",
+            "",
+        )
+        .unwrap();
+        assert_eq!(
+            unknown.nodes[0].gpus,
+            vec![GpuAllocation {
+                model: "a100".into(),
+                total: 4,
+                allocated: None
+            }]
+        );
+        assert_eq!(
+            node_gpus("CfgTRES=gres/gpu=6,gres/gpu:a100=4,gres/gpu:h100=2 AllocTRES=gres/gpu=3"),
+            vec![
+                GpuAllocation {
+                    model: "a100".into(),
+                    total: 4,
+                    allocated: None
+                },
+                GpuAllocation {
+                    model: "h100".into(),
+                    total: 2,
+                    allocated: None
+                }
+            ]
+        );
+        assert_eq!(
+            node_gpus("CfgTRES=gres/gpu=4 AllocTRES=cpu=2"),
+            vec![GpuAllocation {
+                model: "".into(),
+                total: 4,
+                allocated: Some(0)
+            }]
+        );
+    }
 
     #[test]
     fn parses_job_fields_and_utc_instants() {
